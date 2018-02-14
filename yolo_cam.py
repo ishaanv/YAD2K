@@ -1,12 +1,12 @@
 #! /usr/bin/env python
 """Run a YOLO_v2 style detection model on test images."""
 import argparse
+import base64
 import colorsys
-import imghdr
-import io
+from io import BytesIO
+import json
 import os
 import random
-import datetime
 
 import numpy as np
 import picamera
@@ -15,18 +15,24 @@ import pygame
 from keras import backend as K
 from keras.models import load_model
 from PIL import Image, ImageDraw, ImageFont
-
+import websocket
 from yad2k.models.keras_yolo import yolo_eval, yolo_head
 
+
 # Init pygame 
-pygame.init()
-screen = pygame.display.set_mode((720,720))
 resolution = (416,416)
-x = (screen.get_width() - resolution[0]) / 2
-y = (screen.get_height() - resolution[1]) / 2
 
 parser = argparse.ArgumentParser(
     description='Run a YOLO_v2 style detection model on test images..')
+parser.add_argument(
+    '--ws_addr',
+    nargs='?',
+    help='address of websocket if streaming')
+parser.add_argument(
+    '--video',
+    nargs='?',
+    help='display video',
+    default=None)
 parser.add_argument(
     'model_path',
     help='path to h5 model file containing body'
@@ -72,7 +78,18 @@ def _main(args):
     classes_path = os.path.expanduser(args.classes_path)
     test_path = os.path.expanduser(args.test_path)
     output_path = os.path.expanduser(args.output_path)
-
+    url = args.ws_addr
+    video = args.video
+    if video:
+        pygame.init()
+        screen = pygame.display.set_mode((720,720))
+        x = (screen.get_width() - resolution[0]) / 2
+        y = (screen.get_height() - resolution[1]) / 2
+    if url:
+        ws = websocket.create_connection(url)
+        ws.send(json.dumps({'device': 'yolo'})) 
+    else:
+        ws = None
     if not os.path.exists(output_path):
         print('Creating output path {}'.format(output_path))
         os.mkdir(output_path)
@@ -104,7 +121,6 @@ def _main(args):
     # Check if model is fully convolutional, assuming channel last order.
     model_image_size = yolo_model.layers[0].input_shape[1:3]
     is_fixed_size = model_image_size != (None, None)
-
     # Generate colors for drawing bounding boxes.
     hsv_tuples = [(x / len(class_names), 1., 1.)
                   for x in range(len(class_names))]
@@ -130,24 +146,16 @@ def _main(args):
         exitFlag = True
         counter = 0
         while(exitFlag):
-            for event in pygame.event.get():
-                if(event.type is pygame.MOUSEBUTTONDOWN or 
-                event.type is pygame.QUIT):
-                    exitFlag = False
+            if video:
+                for event in pygame.event.get():
+                    if(event.type is pygame.MOUSEBUTTONDOWN or 
+                    event.type is pygame.QUIT):
+                        exitFlag = False
             camera.resolution = resolution
             camera.capture(output, 'rgb')
-            print(output.array.shape)
             image_pixels = output.array
-            # try:
-            #     image_type = imghdr.what(os.path.join(test_path, image_file))
-            #     if not image_type:
-            #         continue
-            # except IsADirectoryError:
-            #     continue
-
-            # image = Image.open(os.path.join(test_path, image_file))
             if is_fixed_size:  # TODO: When resizing we can use minibatch input.
-                image = Image.fromarray(image_pixels)  # FIXME do not reuse varss
+                image = Image.fromarray(image_pixels)
                 resized_image = image.resize(tuple(reversed(model_image_size)), Image.BICUBIC)
                 image_data = np.array(resized_image, dtype='float32')
             else:
@@ -188,7 +196,7 @@ def _main(args):
                 left = max(0, np.floor(left + 0.5).astype('int32'))
                 bottom = min(image.size[1], np.floor(bottom + 0.5).astype('int32'))
                 right = min(image.size[0], np.floor(right + 0.5).astype('int32'))
-                print(label, (left, top), (right, bottom))
+                print("{} identified. Uploading profile to the NSA.".format(label))
 
                 if top - label_size[1] >= 0:
                     text_origin = np.array([left, top - label_size[1]])
@@ -204,16 +212,24 @@ def _main(args):
                     [tuple(text_origin), tuple(text_origin + label_size)],
                     fill=colors[c])
                 draw.text(text_origin, label, fill=(0, 0, 0), font=font)
+
                 # image.save(os.path.join(output_path, str(counter) + '.png'), quality=90)
                 counter += 1
-                
+                buff = BytesIO()
+                image.save(buff, format="JPEG")
+                ws_image_bytes = buff.getvalue()
                 del draw
-
-            py_image = pygame.image.fromstring(image.tobytes()[0:416*416*3], camera.resolution, 'RGB')
-            screen.fill(0)
-            if py_image:
-                screen.blit(py_image, (x,y))
-            pygame.display.update()
+                if ws:
+                    send_data = {'type': 'yolo', 'data': base64.b64encode(ws_image_bytes).decode('utf-8')}
+                ws.send(json.dumps(send_data))
+            image_bytes = image.tobytes()[0:resolution[0]*resolution[1]*3]
+            py_image = pygame.image.fromstring(image_bytes, camera.resolution, 'RGB')
+            if video:
+                screen.fill(0)
+                if py_image:
+                    screen.blit(py_image, (x,y))
+                pygame.display.update()                
+            
                 
     sess.close()
 
